@@ -32,11 +32,31 @@ Settings dict keys
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Callable
+
+log = logging.getLogger("exfat_ripper.metadata")
+
+# Records the reason the most recent fetch attempt failed, so the UI and the
+# log can show *why* a game was not enriched (instead of silently returning {}).
+# Reset at the start of each enrich_game() call.
+_LAST_ERROR: dict[str, str | None] = {"reason": None}
+
+
+def last_error() -> str | None:
+    """Return a human-readable reason for the most recent enrichment miss."""
+    return _LAST_ERROR.get("reason")
+
+
+def _set_error(reason: str | None) -> None:
+    _LAST_ERROR["reason"] = reason
+    if reason:
+        log.warning("metadata: %s", reason)
 
 # Edition / platform suffixes to strip before matching
 _STRIP_PATTERNS = re.compile(
@@ -49,6 +69,52 @@ _STRIP_PATTERNS = re.compile(
 )
 
 _MULTI_SPACE = re.compile(r"\s{2,}")
+
+
+# --- Issue #01c: second-pass search ------------------------------------------
+# Known multi-word edition PHRASES that RAWG typically does not index as their
+# own catalog entry (it indexes the base game instead). When a full-title search
+# scores poorly, we strip a trailing edition phrase and retry with the base
+# title. Deliberately a SHORT, explicit list of phrases we have actually seen —
+# not a general heuristic engine. Add to it only when a real title needs it.
+_EDITION_PHRASES = [
+    "forty years of wrestlemania edition",
+    "40 years of wrestlemania edition",
+    "digital deluxe edition",
+    "game of the year edition",
+    "collector's edition",
+    "collectors edition",
+    "definitive edition",
+    "complete edition",
+    "ultimate edition",
+    "champions edition",
+    "founder's edition",
+    "founders edition",
+    "premium edition",
+    "special edition",
+    "deluxe edition",
+    "gold edition",
+    "director's cut",
+    "directors cut",
+]
+
+
+def strip_edition_phrase(title: str) -> str | None:
+    """
+    If `title` ends with a known edition phrase, return the base title with that
+    phrase removed. Otherwise return None (meaning: nothing to strip, no second
+    pass needed). Case-insensitive; only strips a trailing phrase so we don't
+    mangle titles where such words appear mid-name.
+    """
+    t = (title or "").strip()
+    low = t.lower()
+    for phrase in _EDITION_PHRASES:
+        if low.endswith(phrase):
+            base = t[: len(t) - len(phrase)]
+            base = re.sub(r"[\s:\-–—]+$", "", base).strip()
+            if base and base.lower() != low:
+                return base
+    return None
 
 
 def clean_title(title: str) -> str:
@@ -68,8 +134,55 @@ def _get_json(url: str, headers: dict | None = None, timeout: int = 10) -> dict 
         req.add_header("User-Agent", "exFAT-Ripper/2.0")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
-    except Exception:
+    except urllib.error.HTTPError as e:
+        # Read the body so we can show RAWG/IGDB's own error message.
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            _set_error(f"API rejected request ({e.code}) — check your API key. {body}".strip())
+        elif e.code == 429:
+            _set_error("API rate limit hit (429) — add/verify an API key or wait a moment.")
+        else:
+            _set_error(f"API HTTP {e.code}. {body}".strip())
         return None
+    except urllib.error.URLError as e:
+        _set_error(f"Network error reaching API: {e.reason}")
+        return None
+    except Exception as e:
+        _set_error(f"Unexpected error: {type(e).__name__}: {e}")
+        return None
+
+
+def _get_json_verbose(url: str, timeout: int = 10) -> tuple[int | None, object | None, str]:
+    """
+    Like _get_json but returns (http_status, parsed_json_or_None, note).
+
+    Used by rawg_probe() for diagnostics so the caller can see the exact
+    status code and a short note, without the normal silent-None collapse.
+    On HTTP errors, http_status is the code; on network errors it is None.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "exFAT-Ripper/2.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return r.status, json.loads(raw), ""
+            except Exception:
+                return r.status, None, f"Body was not valid JSON ({len(raw)} bytes)."
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        return e.code, None, body or e.reason or ""
+    except urllib.error.URLError as e:
+        return None, None, f"Network error: {e.reason}"
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
 
 
 def _post_json(url: str, body: bytes, headers: dict, timeout: int = 10) -> dict | list | None:
@@ -78,14 +191,33 @@ def _post_json(url: str, body: bytes, headers: dict, timeout: int = 10) -> dict 
         req.add_header("User-Agent", "exFAT-Ripper/2.0")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
-    except Exception:
+    except urllib.error.HTTPError as e:
+        bd = ""
+        try:
+            bd = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        _set_error(f"API HTTP {e.code}. {bd}".strip())
+        return None
+    except urllib.error.URLError as e:
+        _set_error(f"Network error reaching API: {e.reason}")
+        return None
+    except Exception as e:
+        _set_error(f"Unexpected error: {type(e).__name__}: {e}")
         return None
 
 
 # --- RAWG --------------------------------------------------------------------
 
-def _rawg_search(title: str, api_key: str | None) -> dict | None:
-    """Search RAWG and return the best matching result dict, or None."""
+def _rawg_search(title: str, api_key: str | None, min_score: int = 20) -> dict | None:
+    """Search RAWG and return the best matching result dict, or None.
+
+    `min_score` is the acceptance threshold. The base-title second pass uses a
+    higher value than the default first pass, because a deliberately shortened
+    title is more prone to grabbing a loosely-related sibling (e.g. base 'WWE
+    2K24' loosely matching 'WWE Legends'); requiring a stronger match guards
+    against attaching the wrong game.
+    """
     q = urllib.parse.urlencode({"search": title, "page_size": 5})
     key_param = f"&key={api_key}" if api_key else ""
     url = f"https://api.rawg.io/api/games?{q}{key_param}"
@@ -115,7 +247,16 @@ def _rawg_search(title: str, api_key: str | None) -> dict | None:
         if score > best_score:
             best_score = score
             best = r
-    if best_score < 20:
+    if best_score < min_score:
+        best_name = (best or {}).get("name", "?")
+        msg = (
+            f"RAWG had no confident match for '{title}' "
+            f"(closest: '{best_name}', score {best_score}/{min_score})."
+        )
+        # If the title carries an edition phrase, hint at the base-game retry.
+        if strip_edition_phrase(title):
+            msg += " Suggestion: retry using the base game title."
+        _set_error(msg)
         return None   # too poor a match
     return best
 
@@ -135,6 +276,133 @@ def _rawg_screenshots(slug: str, api_key: str | None) -> list[str]:
     return [s["image"] for s in (data.get("results") or []) if s.get("image")][:6]
 
 
+def _rawg_trailer(slug: str, api_key: str | None) -> dict | None:
+    """
+    Fetch a trailer for a game from RAWG's free /movies endpoint.
+    Returns {name, preview, video} for the first available clip, or None.
+
+    RAWG's /games/{id}/movies returns hosted MP4 clips (not YouTube), so the
+    video URL can be played directly in an HTML5 <video> element. Coverage is
+    sparse — mostly AAA titles — so None is the common, expected result.
+    """
+    if not slug:
+        return None
+    key_param = f"?key={api_key}" if api_key else ""
+    url = f"https://api.rawg.io/api/games/{slug}/movies{key_param}"
+    data = _get_json(url)
+    if not data or not isinstance(data.get("results"), list):
+        return None
+    for clip in data["results"]:
+        # `data` holds the rendition URLs; prefer 'max', fall back to '480'.
+        vids = clip.get("data") or {}
+        video_url = vids.get("max") or vids.get("480") or ""
+        if video_url:
+            return {
+                "name": clip.get("name") or "Trailer",
+                "preview": clip.get("preview") or "",
+                "video": video_url,
+            }
+    return None
+
+
+def _redact_key(url: str) -> str:
+    """Hide the API key in a URL so it is safe to display/log."""
+    return re.sub(r"(key=)[^&]+", r"\1<redacted>", url)
+
+
+def _score_name(clean: str, name: str) -> int:
+    """The exact scoring used by _rawg_search, exposed for the probe."""
+    n = (name or "").lower()
+    if n == clean:
+        return 100
+    if clean in n or n in clean:
+        return 50
+    cw = set(clean.split())
+    nw = set(n.split())
+    if cw and nw:
+        return int(100 * len(cw & nw) / max(len(cw), len(nw)))
+    return 0
+
+
+def rawg_probe(title: str, settings: dict) -> dict:
+    """
+    DIAGNOSTIC — Issue #01a. Probe the RAWG search for a single title and
+    return the full request/status/results/match chain. Does NOT enrich or
+    mutate anything; purely observational.
+
+    Returns a dict with:
+      title, clean_title, key_present, request_url (redacted), http_status,
+      result_count, candidates [{name, score}], best_match, best_score,
+      threshold, accepted (bool), reason (str)
+    """
+    api_key = (settings.get("rawg_api_key") or "").strip() or None
+    clean = clean_title(title)
+    clean_lc = clean.lower()
+
+    q = urllib.parse.urlencode({"search": clean, "page_size": 5})
+    key_param = f"&key={api_key}" if api_key else ""
+    url = f"https://api.rawg.io/api/games?{q}{key_param}"
+
+    status, data, note = _get_json_verbose(url)
+
+    report: dict = {
+        "title": title,
+        "clean_title": clean,
+        "key_present": bool(api_key),
+        "request_url": _redact_key(url),
+        "http_status": status,
+        "result_count": 0,
+        "candidates": [],
+        "best_match": None,
+        "best_score": None,
+        "threshold": 20,
+        "accepted": False,
+        "reason": "",
+    }
+
+    if status is None:
+        report["reason"] = note or "No response (network error)."
+        return report
+    if status in (401, 403):
+        report["reason"] = f"HTTP {status} — API key rejected or missing. {note}".strip()
+        return report
+    if status == 429:
+        report["reason"] = "HTTP 429 — rate limited (add/verify an API key)."
+        return report
+    if status != 200:
+        report["reason"] = f"HTTP {status}. {note}".strip()
+        return report
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        report["reason"] = "HTTP 200 but response shape unexpected (no 'results' list)."
+        return report
+
+    results = data["results"]
+    report["result_count"] = len(results)
+    if not results:
+        report["reason"] = "HTTP 200 but RAWG returned 0 results for this title."
+        return report
+
+    scored = []
+    for r in results:
+        nm = r.get("name") or "?"
+        scored.append({"name": nm, "score": _score_name(clean_lc, nm)})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    report["candidates"] = scored
+    report["best_match"] = scored[0]["name"]
+    report["best_score"] = scored[0]["score"]
+
+    if scored[0]["score"] >= report["threshold"]:
+        report["accepted"] = True
+        report["reason"] = "Match accepted."
+    else:
+        report["accepted"] = False
+        report["reason"] = (
+            f"Best match '{scored[0]['name']}' scored {scored[0]['score']}, "
+            f"below threshold {report['threshold']}."
+        )
+    return report
+
+
 def fetch_rawg(title: str, settings: dict) -> dict | None:
     """
     Fetch enrichment from RAWG. Returns a normalised dict or None.
@@ -146,6 +414,17 @@ def fetch_rawg(title: str, settings: dict) -> dict | None:
         # Try original title
         result = _rawg_search(title, api_key)
     if not result:
+        # Issue #01c — second pass: strip a known edition phrase and retry with
+        # the base title (e.g. "WWE 2K24 Forty Years of WrestleMania Edition"
+        # -> "WWE 2K24"). Only fires when such a phrase is actually present.
+        # Uses a STRICTER threshold (60) so a shortened title accepts only a
+        # near-exact base match, not a loosely-related sibling.
+        base = strip_edition_phrase(title)
+        if base:
+            result = _rawg_search(base, api_key, min_score=60)
+            if result:
+                _set_error(None)  # clear the poor-match reason from pass 1
+    if not result:
         return None
 
     slug = result.get("slug", "")
@@ -154,6 +433,7 @@ def fetch_rawg(title: str, settings: dict) -> dict | None:
         detail = result
 
     screenshots = _rawg_screenshots(slug, api_key) if slug else []
+    trailer = _rawg_trailer(slug, api_key) if slug else None
 
     genres = [g["name"] for g in (detail.get("genres") or [])]
     devs = [d["name"] for d in (detail.get("developers") or [])]
@@ -173,6 +453,7 @@ def fetch_rawg(title: str, settings: dict) -> dict | None:
         "publisher": ", ".join(pubs),
         "cover_url": (detail.get("background_image") or ""),
         "screenshots": screenshots,
+        "trailer": trailer,
         "website": detail.get("website") or "",
         "playtime": detail.get("playtime"),
     }
@@ -336,6 +617,7 @@ def enrich_game(game: dict, settings: dict) -> dict:
     if existing.get("description") and existing.get("source"):
         return existing
 
+    _set_error(None)   # clear any prior reason before this attempt
     enrichment = None
 
     # 1. RAWG
@@ -362,6 +644,7 @@ def enrich_game(game: dict, settings: dict) -> dict:
             pass
 
     if enrichment:
+        _set_error(None)   # success — clear reason
         game["enrichment"] = enrichment
         # Promote cover_url to top-level for cover cache
         if not game.get("cover") and enrichment.get("cover_url"):
@@ -375,13 +658,25 @@ def batch_enrich(
     games: list[dict],
     settings: dict,
     progress_fn: Callable[[str, int, int], None] | None = None,
+    report: dict | None = None,
 ) -> int:
     """
     Enrich all games that lack metadata.
     Returns count of games enriched.
+
+    If `report` (a dict) is supplied, it is populated with diagnostics:
+        report["failures"] = [{title, reason}, ...]   # per-title misses
+        report["rate_limited"] = bool                  # any 429/401 seen
+        report["attempted"], report["enriched"], report["skipped"]
+    This lets the bulk path explain WHY a game was missed, instead of the
+    silent skip that made single-retry-works / bulk-fails indistinguishable.
     """
     total = len(games)
     enriched = 0
+    attempted = 0
+    failures: list[dict] = []
+    rate_limited = False
+
     for i, game in enumerate(games):
         existing = game.get("enrichment") or {}
         if existing.get("description") and existing.get("source"):
@@ -389,8 +684,26 @@ def batch_enrich(
         title = game.get("scraped_title") or game.get("title") or ""
         if progress_fn:
             progress_fn(f"Enriching {i + 1}/{total}: {title}", i + 1, total)
+        attempted += 1
         result = enrich_game(game, settings)
         if result:
             enriched += 1
-        time.sleep(0.2)
+        else:
+            reason = last_error() or "No match found."
+            failures.append({"title": title, "reason": reason})
+            # Detect throttling so the caller can advise the user.
+            low = reason.lower()
+            if "429" in low or "rate limit" in low or "401" in low or "403" in low:
+                rate_limited = True
+        # Pace requests. Back off harder once throttling is detected so the
+        # rest of the batch doesn't cascade into the same rate-limit window.
+        time.sleep(0.5 if rate_limited else 0.2)
+
+    if report is not None:
+        report["failures"] = failures
+        report["rate_limited"] = rate_limited
+        report["attempted"] = attempted
+        report["enriched"] = enriched
+        report["skipped"] = total - attempted
+
     return enriched

@@ -26,6 +26,11 @@ DEFAULTS: dict = {
     "prefer_cached_covers": True, # use cached cover even if remote is available
     "offline_mode": False,        # block all network calls
     "download_covers_on_scrape": True,
+    # PS5 FTP (for sending the Pegasus catalog straight to the console)
+    "ps5_ftp_host": "",           # e.g. 192.168.1.50
+    "ps5_ftp_port": 1337,         # common PS5 homebrew FTP port
+    "ps5_ftp_user": "",           # usually blank / anonymous
+    "ps5_ftp_pass": "",
     # Misc
     "theme": "dark",
     "default_view": "grid",       # grid | list

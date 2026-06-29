@@ -330,6 +330,151 @@ def _section_kind(name: str) -> str:
     return "other"
 
 
+def _listing_signature(card: dict) -> str:
+    """A dedup key that treats genuinely-different builds as distinct.
+
+    Two cards are the SAME listing only if title, PPSA, version, region,
+    firmware/backport text AND their set of download sections all match.
+    This keeps separate entries for e.g. a 9.xx Standard build vs a 4.xx
+    BackPort build of the same game (same title/PPSA but different firmware),
+    instead of dropping the second one as a 'duplicate'.
+    """
+    meta = parse_badges(card.get("tags") or [])
+    title = (card.get("title") or "").strip().lower()
+    # Section names capture structural differences (standard/backport_4.xx/dump…)
+    secs = sorted((s.get("section") or "").lower()
+                  for s in (card.get("sections") or []))
+    parts = [
+        title,
+        (meta.get("ppsa") or "").lower(),
+        (meta.get("version") or "").lower(),
+        (meta.get("region") or "").lower(),
+        (meta.get("backport_text") or "").lower(),
+        "|".join(secs),
+    ]
+    return "::".join(parts)
+
+
+def _card_from_json_entry(entry: dict) -> dict:
+    """Convert one exFAT.json entry into the internal `card` shape that
+    card_to_game() consumes (title / cover / tags / sections / credits).
+
+    pippo's JSON stores each download link as a field whose name encodes the
+    build group and the host, in one of three styles:
+        <group>_<host>   e.g. backport_akia, standard_viki, backport7xx_data,
+                              dlc_akia, dump_viki
+        <host>_url       e.g. akia_url, viki_url        (plain game build)
+        <host>           e.g. akia, viki, data          (plain game build)
+    Hosts: akia, viki, data, filek, vault, buzz (+ any future ones).
+    Empty-string link fields are skipped.
+    """
+    HOSTS = {"akia", "viki", "data", "filek", "vault", "buzz", "mega",
+             "gofile", "pixeldrain", "mediafire", "rootz", "filek"}
+
+    title = (entry.get("title") or "").strip()
+    cover = entry.get("image") or entry.get("cover") or ""
+    tags = list(entry.get("tags") or [])
+
+    # pippo's JSON keeps the size in its own field, not in tags. parse_badges
+    # only reads tags, so fold the size in (if not already present as a tag).
+    size_field = (entry.get("size") or "").strip()
+    if size_field and not any(
+            SIZE_RE.match((t or "").replace(" ", "")) for t in tags):
+        tags.append(size_field)
+
+    credits = {
+        "files": entry.get("credits_files", "") or "",
+        "backport": entry.get("credits_backport", "") or "",
+        "dlc": entry.get("credits_dlc", "") or entry.get("credits_dlcs", "")
+        or "",
+    }
+
+    # group_name -> list of {label, url, is_dlc, is_dump}
+    groups: dict[str, list[dict]] = {}
+
+    def host_label(h: str) -> str:
+        return {
+            "akia": "AkiraBox", "viki": "VikingFile", "data": "DataNodes",
+            "filek": "FileKeeper", "vault": "DataVault", "buzz": "BuzzHeavier",
+            "mega": "Mega", "gofile": "GoFile", "pixeldrain": "PixelDrain",
+            "mediafire": "MediaFire", "rootz": "Rootz",
+        }.get(h, h.title())
+
+    def add(group: str, host: str, url: str):
+        if not url or not isinstance(url, str):
+            return
+        if "decrypt" not in url and "link-lock" not in url and \
+           "http" not in url:
+            return
+        g = group.lower()
+        is_dlc = g.startswith("dlc")
+        is_dump = g.startswith("dump")
+        groups.setdefault(g, []).append({
+            "label": host_label(host),
+            "url": url,
+            "is_dlc": is_dlc,
+            "is_dump": is_dump,
+        })
+
+    for key, val in entry.items():
+        if not isinstance(val, str) or not val:
+            continue
+        k = key.lower()
+        # style 2: <host>_url  -> plain game build
+        if k.endswith("_url"):
+            host = k[:-4]
+            if host in HOSTS:
+                add("standard", host, val)
+            continue
+        # style 1: <group>_<host>
+        if "_" in k:
+            grp, host = k.rsplit("_", 1)
+            if host in HOSTS and grp:
+                add(grp, host, val)
+                continue
+        # style 3: bare <host>
+        if k in HOSTS:
+            add("standard", k, val)
+
+    # Build the sections list in card shape. Map JSON group names to the
+    # section names card_to_game/_section_kind already understand.
+    def section_name(group: str) -> str:
+        g = group.lower()
+        if g == "standard":
+            return "standard"
+        if g == "backport":
+            return "backport"
+        if g.startswith("backport"):          # backport7xx -> backport_7.xx
+            tier = g[len("backport"):]
+            tier = tier.replace("xx", ".xx") if "xx" in tier and \
+                "." not in tier else tier
+            # backport7xx -> 7.xx ; backport4xx -> 4.xx
+            import re as _re
+            m = _re.match(r"(\d)\.?xx", tier)
+            if m:
+                return f"backport_{m.group(1)}.xx"
+            return "backport"
+        if g.startswith("dlc"):
+            return "dlcs"
+        if g.startswith("dump"):
+            return "dump"
+        return g
+
+    sections = []
+    for group, links in groups.items():
+        if not links:
+            continue
+        sections.append({"section": section_name(group), "links": links})
+
+    return {
+        "title": title,
+        "cover": cover,
+        "tags": tags,
+        "sections": sections,
+        "credits": credits,
+    }
+
+
 def card_to_game(card: dict) -> dict:
     """Convert a scraped card into a stored game dict. Keeps the LOCKED URLs;
     resolved URLs are filled in later, on demand, by core/decrypt.py."""
@@ -371,14 +516,23 @@ def card_to_game(card: dict) -> dict:
     }
 
 
+EXFAT_JSON_URL = BASE_URL + "exFAT.json"
+
+
 def scrape_library(password: str = SITE_PASSWORD,
                     progress: Callable[[str, int, int], None] | None = None,
                     headless: bool = True,
                     max_pages: int = 0) -> list[dict]:
-    """Walk the whole site and return a list of game dicts (with locked URLs).
+    """Fetch the library directly from exFAT.json and return a list of game
+    dicts (with locked URLs, decrypted later on demand by core/decrypt.py).
 
-    progress(message, current, total) is called as pages are scanned, so the
-    UI can show a progress bar. current/total are page numbers.
+    pippo moved the library from rendered HTML cards to a single JSON data
+    file, so there's no browser/page-walk any more — one HTTP request gets
+    everything. `headless` and `max_pages` are kept for signature
+    compatibility; `max_pages` (if set) caps the number of entries processed.
+
+    progress(message, current, total) is called as entries are processed so
+    the UI can show a progress bar.
     """
     def report(msg, cur=0, tot=0):
         if progress:
@@ -387,44 +541,104 @@ def scrape_library(password: str = SITE_PASSWORD,
             except Exception:
                 pass
 
-    browser = Browser(headless=headless)
+    report("Fetching library data…", 0, 0)
+
+    # 1. Download exFAT.json. Try a normal urllib request first; if that's
+    #    blocked (Cloudflare), fall back to cloudscraper, then to a browser
+    #    fetch as a last resort.
+    raw_text = ""
+    last_err = ""
+    try:
+        req = urllib.request.Request(
+            EXFAT_JSON_URL,
+            headers={"User-Agent": "Mozilla/5.0 (exFAT-Ripper)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw_text = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        last_err = str(e)
+        try:
+            import cloudscraper  # type: ignore
+            sc = cloudscraper.create_scraper()
+            resp = sc.get(EXFAT_JSON_URL, timeout=30)
+            if resp.ok:
+                raw_text = resp.text
+        except Exception as e2:
+            last_err = f"{last_err} / {e2}"
+
+    # Last resort: pull it through a real browser (handles Cloudflare JS).
+    if not raw_text:
+        try:
+            raw_text = _fetch_json_via_browser(EXFAT_JSON_URL, headless)
+        except Exception as e3:
+            last_err = f"{last_err} / browser: {e3}"
+
+    if not raw_text:
+        raise RuntimeError(
+            "Could not download the library data (exFAT.json). The site may "
+            "be unreachable or behind a Cloudflare challenge. "
+            f"({last_err})")
+
+    # 2. Parse JSON.
+    import json as _json
+    try:
+        data = _json.loads(raw_text)
+    except Exception as e:
+        raise RuntimeError(f"Library data wasn't valid JSON: {e}")
+    if isinstance(data, dict):
+        data = data.get("games") or data.get("entries") or []
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected library data format.")
+
+    if max_pages:
+        data = data[:max_pages]
+
+    # 3. Convert each entry -> game dict, deduping genuinely-identical listings.
     games: list[dict] = []
     seen: set[str] = set()
+    total = len(data)
+    for idx, entry in enumerate(data, 1):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            card = _card_from_json_entry(entry)
+            if not card.get("sections"):
+                continue  # entry with no resolvable links — skip
+            key = _listing_signature(card)
+            if key in seen:
+                continue
+            seen.add(key)
+            games.append(card_to_game(card))
+        except Exception:
+            continue
+        if idx % 25 == 0 or idx == total:
+            report(f"Processing {idx}/{total} — {len(games)} games",
+                   idx, total)
+
+    report(f"Done — {len(games)} games", total, total)
+    return games
+
+
+def _fetch_json_via_browser(url: str, headless: bool = True) -> str:
+    """Last-resort fetch of a JSON URL through Playwright (clears Cloudflare
+    JS challenges a plain request can't). Returns the response body text."""
+    browser = Browser(headless=headless)
     try:
-        mode = browser.start()
-        report(f"Browser ready ({mode}).", 0, 0)
+        browser.start()
         page = browser.ctx.new_page()
         try:
-            report("Loading site...", 0, 0)
-            page.goto(BASE_URL, wait_until="domcontentloaded",
-                      timeout=PAGE_LOAD_TIMEOUT_MS)
-            if not _pass_site_gate(page, password):
-                raise RuntimeError("Could not pass the site password gate.")
-            try:
-                page.wait_for_selector(".game-card", timeout=CARD_WAIT_TIMEOUT_MS)
-            except Exception:
-                raise RuntimeError(
-                    "Game grid never appeared — the site may be showing a "
-                    "Cloudflare/CAPTCHA challenge. Open it once in Brave, "
-                    "solve it, then retry.")
-            _go_to_page_one(page)
-            total = _get_page_count(page)
-            if max_pages:
-                total = min(total, max_pages)
-            for p_idx in range(1, total + 1):
-                cards = page.evaluate(CARD_EXTRACT_JS)
-                added = 0
-                for c in cards:
-                    key = c["title"].strip().lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    games.append(card_to_game(c))
-                    added += 1
-                report(f"Page {p_idx}/{total} — {len(games)} games found",
-                       p_idx, total)
-                if p_idx < total and not _next_page(page):
-                    break
+            resp = page.goto(url, wait_until="domcontentloaded",
+                             timeout=PAGE_LOAD_TIMEOUT_MS)
+            # If Cloudflare interstitial, give it a moment then re-read.
+            body = page.evaluate("() => document.body ? document.body.innerText : ''")
+            txt = (body or "").strip()
+            if txt.startswith("[") or txt.startswith("{"):
+                return txt
+            if resp:
+                try:
+                    return resp.text()
+                except Exception:
+                    pass
+            return txt
         finally:
             try:
                 page.close()
@@ -432,4 +646,4 @@ def scrape_library(password: str = SITE_PASSWORD,
                 pass
     finally:
         browser.stop()
-    return games
+

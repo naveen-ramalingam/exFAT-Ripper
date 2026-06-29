@@ -1,10 +1,18 @@
 """
 core/decrypt.py
 ---------------
-Offline Link Lock decryption. The .exFAT site wraps every download link in a
-jstrieb/link-lock URL — AES-GCM ciphertext, key derived via PBKDF2-HMAC-SHA256
-(100,000 iterations). The locked URL is captured during the fast page-walk;
-this module turns it into the real download URL with no browser, instantly.
+Offline Link Lock decryption. The .exFAT site wraps every download link in an
+AES-GCM ciphertext, key derived via PBKDF2-HMAC-SHA256. The locked URL is read
+straight from exFAT.json; this module turns it into the real download URL with
+no browser, instantly.
+
+pippo's link-lock format has two generations and this module handles both:
+  • Legacy: /link-lock-pippo/#<b64 {e,s,i}>, 100k iterations, salt+iv always
+    present.
+  • Current: /library-decrypt/decrypt-public.html#<b64 {v,e[,s][,i],n}>,
+    600k iterations, "compact" payload where the salt and/or iv are OMITTED
+    when they are the all-zero default. The decrypted plaintext is JSON
+    {"v":..,"u":"<real url>"} rather than a bare URL.
 """
 from __future__ import annotations
 
@@ -15,7 +23,14 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-PBKDF2_ITERATIONS = 100_000
+# Iteration counts to try, newest first. pippo bumped 100k -> 600k.
+PBKDF2_ITERATION_CANDIDATES = (600_000, 100_000)
+
+# Base64 of the all-zero default salt (16 bytes) / iv (12 bytes) the compact
+# format uses as sentinels for "omitted".
+_ZERO_SALT_B64 = "AAAAAAAAAAAAAAAAAAAAAA"   # 16 zero bytes
+_ZERO_IV_B64 = "AAAAAAAAAAAAAAAA"            # 12 zero bytes (not relied on; we
+                                            # just treat a missing iv as zeros)
 
 # Cache so repeated identical locked URLs only decrypt once per session.
 _cache: dict[tuple[str, str], str] = {}
@@ -23,7 +38,16 @@ _cache: dict[tuple[str, str], str] = {}
 
 def is_link_lock_url(url: str) -> bool:
     u = url or ""
-    return "link-lock" in u and "#" in u
+    if "#" not in u:
+        return False
+    return ("link-lock" in u) or ("library-decrypt" in u) or \
+           ("decrypt-public" in u)
+
+
+def _b64d(s: str) -> bytes:
+    s = (s or "").replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)            # restore base64 padding
+    return base64.b64decode(s)
 
 
 def decrypt_link_lock(url: str, password: str) -> str:
@@ -34,20 +58,47 @@ def decrypt_link_lock(url: str, password: str) -> str:
     ckey = (url, password)
     if ckey in _cache:
         return _cache[ckey]
+
+    result = ""
     try:
         frag = url.split("#", 1)[1].strip()
-        frag += "=" * (-len(frag) % 4)  # restore base64 padding
-        payload = json.loads(base64.b64decode(frag))
-        e = base64.b64decode(payload["e"])   # ciphertext + GCM tag
-        s = base64.b64decode(payload["s"])   # salt
-        i = base64.b64decode(payload["i"])   # iv / nonce
-        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=s,
-                         iterations=PBKDF2_ITERATIONS)
-        key = kdf.derive(password.encode("utf-8"))
-        plaintext = AESGCM(key).decrypt(i, e, None)
-        result = plaintext.decode("utf-8", errors="replace").strip()
+        payload = json.loads(_b64d(frag))
+
+        e = _b64d(payload["e"])                      # ciphertext + GCM tag
+
+        # Salt: present & non-default -> use it; otherwise 16 zero bytes.
+        s_b64 = payload.get("s")
+        salt = _b64d(s_b64) if (s_b64 and s_b64 != _ZERO_SALT_B64) else bytes(16)
+
+        # IV: present & non-default -> use it; otherwise 12 zero bytes.
+        i_b64 = payload.get("i")
+        iv = _b64d(i_b64) if i_b64 else bytes(12)
+
+        pwd = password.encode("utf-8")
+        plaintext = None
+        for iters in PBKDF2_ITERATION_CANDIDATES:
+            try:
+                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                                 salt=salt, iterations=iters)
+                key = kdf.derive(pwd)
+                plaintext = AESGCM(key).decrypt(iv, e, None)
+                break                                 # success -> stop trying
+            except Exception:
+                continue
+
+        if plaintext is not None:
+            text = plaintext.decode("utf-8", errors="replace").strip()
+            # Current format wraps the URL as JSON {"v":..,"u":"<url>"}.
+            if text.startswith("{"):
+                try:
+                    obj = json.loads(text)
+                    text = (obj.get("u") or obj.get("url") or "").strip()
+                except Exception:
+                    pass
+            result = text
     except Exception:
         result = ""
+
     _cache[ckey] = result
     return result
 
@@ -58,6 +109,8 @@ _HOST_KEYS = [
     ("datanodes.",  "datanodes"),
     ("vikingfile.", "vikingfile"),
     ("vik1ngfile.", "vikingfile"),
+    ("filekeeper.", "filekeeper"),
+    ("datavault",   "datavault"),
     ("buzzheavier", "buzzheavier"),
     ("mediafire.",  "mediafire"),
     ("1fichier.",   "1fichier"),
@@ -132,8 +185,8 @@ def resolve_game_links(game: dict, password: str) -> dict:
             })
 
     # Convert the {LABEL: [links]} map into the {regions, builds} structure
-    # the UI's detail panel now expects (same shape dlps_sections returns),
-    # so exFAT and dlpsgame both feed renderLinks an identical structure.
+    # the UI's detail panel expects, so every source feeds renderLinks an
+    # identical structure.
     return _to_regions(game, out)
 
 
