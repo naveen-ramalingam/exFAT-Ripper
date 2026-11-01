@@ -92,11 +92,13 @@ def _find_playwright_browsers():
     return None
 
 _pw_browsers = _find_playwright_browsers()
-if _pw_browsers:
+if _pw_browsers and not IS_MAC:
     for _child in _pw_browsers.iterdir():
         if _child.is_dir():
             _pw_datas.append((str(_child), f"ms-playwright/{_child.name}"))
     print(f"[spec] bundling Playwright browsers from: {_pw_browsers}")
+elif IS_MAC:
+    print("[spec] macOS detected: Playwright uses ~/Library/Caches/ms-playwright (avoids nested .app bundle codesign conflict)")
 else:
     print("[spec] WARNING: no ms-playwright folder found — the app will rely "
           "on a system Chromium or an attached Brave. Run "
@@ -162,7 +164,7 @@ elif IS_MAC:
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=True,  # Required for macOS app bundles
-        target_arch='universal2',  # Supports both Intel & Apple Silicon
+        target_arch=None,  # Builds for native architecture (e.g. arm64 on Apple Silicon)
         codesign_identity=None,
         entitlements_file=None,
         icon="app.icns" if os.path.exists("app.icns") else ("app.png" if os.path.exists("app.png") else None),

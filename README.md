@@ -123,12 +123,39 @@ dist\PS5 exFAT Library.exe
 
 Move/copy the `.exe` anywhere — it keeps its `exfat_games.json` next to itself.
 
-## Running without building
+## Building for macOS (.app bundle)
+
+You need **Python 3.10+** (e.g. `brew install python@3.12`).
+
+```bash
+chmod +x build_mac.sh
+./build_mac.sh
+```
+
+Installs dependencies, configures Playwright Chromium, and builds a native Apple Silicon/Intel bundle:
 
 ```
+dist/exFAT Ripper.app
+```
+
+You can copy this into `/Applications/` to use it like any Mac application.
+
+## Running without building
+
+**Windows:**
+```bat
 python -m pip install -r requirements.txt
 python -m playwright install chromium
 run_app.bat
+```
+
+**macOS:**
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+./run_app.sh
 ```
 
 ---
