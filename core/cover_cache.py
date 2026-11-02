@@ -135,32 +135,44 @@ def repair_missing(
     games: list[dict],
     data_dir: Path,
     progress_fn: Callable[[str, int, int], None] | None = None,
+    max_workers: int = 8,
 ) -> int:
     """
     Re-download covers that are missing from disk.
     Mutates game dicts in-place with updated cover_local_path.
     Returns number of covers repaired.
     """
-    total = len(games)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    needed: list[dict] = []
+    for g in games:
+        local = g.get("cover_local_path", "")
+        if not local or not Path(local).exists() or Path(local).stat().st_size <= 512:
+            needed.append(g)
+
+    if not needed:
+        return 0
+
+    total = len(needed)
     repaired = 0
-    for i, game in enumerate(games):
-        if progress_fn:
-            progress_fn(
-                f"Checking cover {i + 1}/{total}: {game.get('title', '?')}",
-                i + 1, total,
-            )
-        local = game.get("cover_local_path", "")
-        needs_repair = (
-            not local
-            or not Path(local).exists()
-            or Path(local).stat().st_size <= 512
-        )
-        if needs_repair:
-            path = ensure_cover(game, data_dir, force=True)
-            if path:
-                game["cover_local_path"] = path
-                repaired += 1
-        time.sleep(0.05)   # gentle rate limit
+
+    def _worker(game: dict) -> tuple[dict, str | None]:
+        path = ensure_cover(game, data_dir, force=True)
+        return game, path
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as executor:
+        futures = {executor.submit(_worker, g): g for g in needed}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                game, path = fut.result()
+                if path:
+                    game["cover_local_path"] = path
+                    repaired += 1
+            except Exception:
+                pass
+            if progress_fn and (i % 5 == 0 or i == total):
+                progress_fn(f"Repairing covers {i}/{total}…", i, total)
+
     return repaired
 
 
@@ -168,27 +180,56 @@ def bulk_cache_covers(
     games: list[dict],
     data_dir: Path,
     progress_fn: Callable[[str, int, int], None] | None = None,
+    max_workers: int = 8,
 ) -> int:
     """
     Cache covers for all games that don't already have a local copy.
     Mutates game dicts in-place with cover_local_path.
+    Downloads concurrently for high speed.
     Returns number of new covers downloaded.
     """
-    total = len(games)
-    downloaded = 0
-    for i, game in enumerate(games):
-        if progress_fn:
-            progress_fn(
-                f"Caching covers {i + 1}/{total}…",
-                i + 1, total,
-            )
-        # Skip if already cached
-        local = game.get("cover_local_path", "")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    covers_dir = data_dir / "covers"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Quickly filter games that actually need a cover
+    needed: list[dict] = []
+    for g in games:
+        local = g.get("cover_local_path", "")
         if local and Path(local).exists() and Path(local).stat().st_size > 512:
             continue
+        ppsa = (g.get("ppsa") or "").strip()
+        url = cover_url_for_game(g)
+        if url:
+            fname = _safe_filename(ppsa or hashlib.md5(url.encode()).hexdigest()[:8], url)
+            dest = covers_dir / fname
+            if dest.exists() and dest.stat().st_size > 512:
+                g["cover_local_path"] = str(dest)
+                continue
+        needed.append(g)
+
+    if not needed:
+        return 0
+
+    total = len(needed)
+    downloaded = 0
+
+    def _worker(game: dict) -> tuple[dict, str | None]:
         path = ensure_cover(game, data_dir)
-        if path:
-            game["cover_local_path"] = path
-            downloaded += 1
-        time.sleep(0.1)   # rate limit
+        return game, path
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as executor:
+        futures = {executor.submit(_worker, g): g for g in needed}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                game, path = fut.result()
+                if path:
+                    game["cover_local_path"] = path
+                    downloaded += 1
+            except Exception:
+                pass
+            if progress_fn and (i % 5 == 0 or i == total):
+                progress_fn(f"Caching covers {i}/{total}…", i, total)
+
     return downloaded

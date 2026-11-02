@@ -288,6 +288,13 @@ class Api:
         # existing callers that pass only (message, current, total) still work.
         import time as _t
         now = _t.monotonic()
+        # Throttle evaluate_js calls to prevent WKWebView / Cocoa RunLoop congestion on macOS
+        last_call = getattr(self, "_last_progress_call", 0.0)
+        is_key_frame = (current <= 1 or current >= total or total == 0)
+        if not is_key_frame and (now - last_call) < 0.06:
+            return
+        self._last_progress_call = now
+
         # Track operation start to derive a smoothed ETA.
         if not hasattr(self, "_op_started_at") or current <= 1:
             self._op_started_at = now
@@ -336,6 +343,15 @@ class Api:
                      password: str = SITE_PASSWORD) -> dict:
         if self._busy:
             return {"ok": False, "error": "A scrape is already running."}
+
+        # Route specific tasks to their dedicated workers
+        if mode == "metadata":
+            return self.enrich_all(source)
+        if mode == "covers":
+            return self.repair_covers(source)
+        if mode == "rebuild_covers":
+            return self.rebuild_cover_cache(source)
+
         self._busy = True
         t = threading.Thread(target=self._scrape_worker,
                              args=(source, mode, password), daemon=True)
@@ -353,7 +369,7 @@ class Api:
                 except Exception:
                     existing = []
 
-            self._progress("Starting browser...", 0, 0)
+            self._progress("Checking exFAT library...", 0, 0)
             scraped = scrape_library(
                 password=password,
                 progress=self._progress,
@@ -381,8 +397,8 @@ class Api:
                             g["enrichment"] = old["enrichment"]
                         if old.get("cover_local_path"):
                             g["cover_local_path"] = old["cover_local_path"]
-                merged = existing + fresh
-                games_to_save = merged
+                games_to_save = scraped
+                target_games = fresh
             else:
                 # Full scrape: preserve existing enrichment by title
                 if path.exists():
@@ -402,30 +418,31 @@ class Api:
                     except Exception:
                         pass
                 games_to_save = scraped
+                target_games = games_to_save
 
             self._save(source, games_to_save)
 
-            # Auto-cache covers
-            if self._settings.get("download_covers_on_scrape", True):
-                self._progress("Caching cover images…", 0, len(games_to_save))
+            # Auto-cache covers (only for target_games)
+            if target_games and self._settings.get("download_covers_on_scrape", True):
+                self._progress("Caching cover images…", 0, len(target_games))
                 downloaded = bulk_cache_covers(
-                    games_to_save, data_dir(),
+                    target_games, data_dir(),
                     progress_fn=self._progress,
                 )
                 # Save again with cover paths
                 self._save(source, games_to_save)
                 self._progress(f"Covers cached: {downloaded}", 0, 0)
 
-            # Auto-enrich metadata
-            if self._settings.get("auto_enrich", True) and not self._settings.get("offline_mode"):
-                self._progress("Enriching metadata…", 0, len(games_to_save))
+            # Auto-enrich metadata (only for target_games)
+            if target_games and self._settings.get("auto_enrich", True) and not self._settings.get("offline_mode"):
+                self._progress("Enriching metadata…", 0, len(target_games))
                 enriched_count = batch_enrich(
-                    games_to_save, self._settings,
+                    target_games, self._settings,
                     progress_fn=self._progress,
                 )
                 # Cover URLs may have been populated during enrichment
                 if self._settings.get("download_covers_on_scrape", True):
-                    bulk_cache_covers(games_to_save, data_dir())
+                    bulk_cache_covers(target_games, data_dir())
                 self._save(source, games_to_save)
                 self._progress(f"Metadata enriched: {enriched_count} games", 0, 0)
 

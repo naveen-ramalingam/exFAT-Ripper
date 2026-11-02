@@ -128,7 +128,7 @@ def clean_title(title: str) -> str:
 
 # --- HTTP helpers ------------------------------------------------------------
 
-def _get_json(url: str, headers: dict | None = None, timeout: int = 10) -> dict | list | None:
+def _get_json(url: str, headers: dict | None = None, timeout: int = 5) -> dict | list | None:
     try:
         req = urllib.request.Request(url, headers=headers or {})
         req.add_header("User-Agent", "exFAT-Ripper/2.0")
@@ -336,10 +336,21 @@ def rawg_probe(title: str, settings: dict) -> dict:
       threshold, accepted (bool), reason (str)
     """
     api_key = (settings.get("rawg_api_key") or "").strip() or None
-    clean = clean_title(title)
-    clean_lc = clean.lower()
-
-    q = urllib.parse.urlencode({"search": clean, "page_size": 5})
+    if not api_key:
+        return {
+            "title": title,
+            "clean_title": clean,
+            "key_present": False,
+            "request_url": "",
+            "http_status": None,
+            "result_count": 0,
+            "candidates": [],
+            "best_match": None,
+            "best_score": 0,
+            "threshold": 20,
+            "accepted": False,
+            "reason": "No RAWG API key configured in Settings.",
+        }
     key_param = f"&key={api_key}" if api_key else ""
     url = f"https://api.rawg.io/api/games?{q}{key_param}"
 
@@ -408,6 +419,8 @@ def fetch_rawg(title: str, settings: dict) -> dict | None:
     Fetch enrichment from RAWG. Returns a normalised dict or None.
     """
     api_key = (settings.get("rawg_api_key") or "").strip() or None
+    if not api_key:
+        return None
     clean = clean_title(title)
     result = _rawg_search(clean, api_key)
     if not result:

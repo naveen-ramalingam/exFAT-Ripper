@@ -26,9 +26,9 @@ else
 fi
 
 # Verify Python version >= 3.10
-PY_VER=$($PY -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PY_MAJOR=$($PY -c "import sys; print(sys.version_info.major)")
-PY_MINOR=$($PY -c "import sys; print(sys.version_info.minor)")
+PY_VER=$("$PY" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PY_MAJOR=$("$PY" -c "import sys; print(sys.version_info.major)")
+PY_MINOR=$("$PY" -c "import sys; print(sys.version_info.minor)")
 
 if [ "$PY_MAJOR" -lt 3 ] || ([ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]); then
     echo "[X] Python $PY_VER found, but Python 3.10+ is required."
